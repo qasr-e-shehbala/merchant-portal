@@ -1,0 +1,932 @@
+// ============================================================================
+// Qasar-e-Shehbala — PostgreSQL schema (Prisma)
+//
+// Conventions (see docs/DATABASE.md for full rationale):
+//   • Money:    BigInt minor units (paisa). NEVER Float/Decimal. Field suffix *Minor.
+//   • Identity: cuid() PKs + a human-facing ref where one is shared externally.
+//   • Customer identity = phone (E.164). Email optional.
+//   • Soft delete: deletedAt on catalog/identity entities ONLY.
+//                  Orders/Payments are immutable financial records — cancel via status.
+//   • Multi-branch (NOT multi-tenant): branchId on location-sensitive entities.
+//                  Product/Customer/Category/Fabric stay GLOBAL.
+//   • Snapshot:  measurements + prices are copied onto OrderItem at order time.
+//   • Audit:     OrderEvent (domain timeline) + AuditLog (admin mutations).
+//
+// PHASE tags mark when to actually build each thing. Phase-1 models are the
+// launchable core; Phase-2/3 models can stay unmigrated until their trigger.
+// ============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearchPostgres"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // pooled PgBouncer (transaction mode) — used by the app
+  directUrl = env("DIRECT_URL") // direct connection — used by `prisma migrate`
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum ProductType {
+  STOCK // ready-to-wear, has inventory
+  MADE_TO_ORDER // tailored, no stock; constrained by tailor time / fabric
+  BOTH
+}
+
+enum ItemKind {
+  STOCK
+  MADE_TO_ORDER
+}
+
+enum OrderStatus {
+  LEAD // created from enquiry / WhatsApp / walk-in, not yet confirmed
+  CONFIRMED // confirmed (ideally via WhatsApp)
+  IN_PROGRESS // payment taken and/or tailoring underway
+  READY
+  DISPATCHED
+  DELIVERED
+  CANCELLED
+  RTO // return-to-origin
+}
+
+enum PaymentStatus {
+  UNPAID
+  DEPOSIT_PAID
+  PARTIALLY_PAID
+  PAID
+  REFUNDED
+  COD_PENDING
+}
+
+enum PaymentType {
+  DEPOSIT
+  BALANCE
+  FULL
+  COD
+}
+
+enum PaymentMethod {
+  RAAST
+  BANK_TRANSFER
+  JAZZCASH
+  EASYPAISA
+  SAFEPAY_LINK
+  CARD
+  CASH
+  COD
+}
+
+enum PaymentRecordStatus {
+  PENDING // recorded, awaiting human verification (screenshot)
+  VERIFIED
+  FAILED
+  REFUNDED
+}
+
+enum Channel {
+  WEB
+  WHATSAPP
+  IN_STORE
+  PHONE
+  INSTAGRAM
+}
+
+enum LeadSource {
+  DIRECT_WHATSAPP
+  REFERRAL
+  WALK_IN
+  INSTAGRAM
+  WEB
+  PHONE
+}
+
+enum LeadStage {
+  ENQUIRY
+  MEASURED
+  DEPOSIT_PAID
+  IN_TAILORING
+  READY_FOR_FITTING
+  DELIVERED
+  LOST
+}
+
+enum FulfillmentType {
+  IN_STORE_COLLECTION // default for high-ticket groom wear
+  SHIP
+}
+
+enum TailoringStage {
+  ENQUIRY
+  MEASURED
+  DEPOSIT_PAID
+  CUTTING
+  STITCHING
+  FITTING
+  REWORK
+  FINISHING
+  READY
+  DELIVERED
+  CANCELLED
+}
+
+enum MeasurementMethod {
+  IN_STORE
+  SELF_MEASURED
+  FROM_OLD_GARMENT
+}
+
+enum StaffRole {
+  OWNER
+  MANAGER
+  SHOP_STAFF
+  TAILOR // karigar
+  CONTENT_EDITOR
+}
+
+enum AppointmentType {
+  CONSULTATION
+  MEASUREMENT
+  FITTING
+  COLLECTION
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  DONE
+  NO_SHOW
+  RESCHEDULED
+  CANCELLED
+}
+
+enum CouponType {
+  PERCENT
+  FIXED
+}
+
+enum ContentStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum ContentType {
+  ARTICLE
+  LOOKBOOK
+}
+
+enum ShipmentStatus {
+  BOOKED
+  IN_TRANSIT
+  DELIVERED
+  RETURNED
+}
+
+enum Courier {
+  POSTEX
+  TCS
+  LEOPARDS
+  MP
+  TRAX
+  OTHER
+}
+
+enum OrderEventType {
+  CREATED
+  CONFIRMED_WHATSAPP
+  STATUS_CHANGED
+  PAYMENT_RECORDED
+  DEPOSIT_VERIFIED
+  STAGE_CHANGED
+  DISPATCHED
+  DELIVERED
+  CANCELLED
+  RTO
+  NOTE
+}
+
+// ============================================================================
+// IDENTITY & MULTI-BRANCH
+// ============================================================================
+
+/// Physical location. Seed exactly ONE row at launch (Saddar, Rawalpindi).
+/// A "production unit" vs "retail front" split is also just a Branch.
+model Branch {
+  id        String   @id @default(cuid())
+  name      String
+  city      String
+  address   String?
+  phone     String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  staff            Staff[]
+  orders           Order[]
+  stockLevels      StockLevel[]
+  appointments     Appointment[]
+  tailoringJobs    TailoringJob[]
+  shipments        Shipment[]
+  stockAdjustments StockAdjustment[]
+
+  @@map("branches")
+}
+
+/// Staff IS the auth principal (Auth.js credentials). Customers do NOT log in.
+/// Soft-deletable so historical orders/jobs keep a valid actor reference.
+model Staff {
+  id           String    @id @default(cuid())
+  name         String
+  email        String    @unique
+  passwordHash String?
+  totpSecret   String? // owner MFA
+  phone        String?
+  role         StaffRole @default(SHOP_STAFF)
+  branchId     String?
+  isActive     Boolean   @default(true)
+  deletedAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  branch                Branch?           @relation(fields: [branchId], references: [id])
+  assignedTailoringJobs TailoringJob[]    @relation("AssignedTailor")
+  tailoringEvents       TailoringEvent[]
+  verifiedPayments      Payment[]         @relation("VerifiedBy")
+  orderEvents           OrderEvent[]
+  auditLogs             AuditLog[]
+  blogPosts             BlogPost[]
+  handledAppointments   Appointment[]
+  stockAdjustments      StockAdjustment[]
+
+  @@index([branchId])
+  @@index([role])
+  @@map("staff")
+}
+
+/// Customer. Phone (E.164) is the real identity; email is optional.
+model Customer {
+  id            String    @id @default(cuid())
+  phone         String    @unique // E.164, e.g. 923001234567
+  name          String?
+  email         String?
+  city          String?
+  whatsappOptIn Boolean   @default(true)
+  notes         String?
+  deletedAt     DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  addresses           Address[]
+  measurementProfiles MeasurementProfile[]
+  orders              Order[]
+  leads               Lead[]
+  appointments        Appointment[]
+  couponRedemptions   CouponRedemption[]
+
+  @@index([city])
+  @@index([createdAt])
+  @@map("customers")
+}
+
+model Address {
+  id         String   @id @default(cuid())
+  customerId String
+  line1      String
+  area       String?
+  city       String
+  province   String? // for courier zoning / RTO-risk, not tax
+  phone      String?
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  @@index([customerId])
+  @@map("addresses")
+}
+
+// ============================================================================
+// CATALOG
+// ============================================================================
+
+model Category {
+  id              String    @id @default(cuid())
+  slug            String    @unique
+  name            String
+  parentId        String?
+  // SEO (embedded, not a polymorphic table)
+  metaTitle       String?
+  metaDescription String?
+  introCopy       String? // 150-300 words unique copy — anti-thin-content
+  sortOrder       Int       @default(0)
+  isActive        Boolean   @default(true)
+  deletedAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryTree")
+  products Product[]
+
+  @@index([parentId])
+  @@map("categories")
+}
+
+model Product {
+  id                String      @id @default(cuid())
+  slug              String      @unique
+  name              String
+  description       String? // unique 2-4 sentence copy required before publish
+  productType       ProductType @default(MADE_TO_ORDER)
+  categoryId        String?
+  basePriceMinor    BigInt      @default(0) // PKR paisa
+  isPublished       Boolean     @default(false)
+  // SEO
+  metaTitle         String?
+  metaDescription   String?
+  ogImageKey        String? // R2 key
+  romanUrduKeywords String? // synonym layer e.g. "dulha ki sherwani"
+  deletedAt         DateTime?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  category      Category?             @relation(fields: [categoryId], references: [id])
+  variants      ProductVariant[]
+  images        ProductImage[]
+  fabricOptions ProductFabricOption[]
+  orderItems    OrderItem[]
+  leads         Lead[]
+  contentLinks  ContentProductLink[]
+
+  @@index([categoryId, isPublished])
+  @@index([isPublished])
+  @@map("products")
+}
+
+model ProductVariant {
+  id                 String    @id @default(cuid())
+  productId          String
+  sku                String    @unique
+  attributes         Json // { size, color, ... } — flexible until canonical set stabilizes
+  priceOverrideMinor BigInt?
+  isStockTracked     Boolean   @default(false)
+  deletedAt          DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  product     Product           @relation(fields: [productId], references: [id])
+  stockLevels StockLevel[]
+  orderItems  OrderItem[]
+  adjustments StockAdjustment[]
+
+  @@index([productId])
+  @@map("product_variants")
+}
+
+model ProductImage {
+  id        String   @id @default(cuid())
+  productId String
+  r2Key     String // object key in Cloudflare R2
+  alt       String // REQUIRED for SEO (Google Images/Lens) — enforce in app
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id])
+
+  @@index([productId])
+  @@map("product_images")
+}
+
+/// Fabric. on_hand_meters is OPTIONAL — many Saddar tailors source per-order.
+model Fabric {
+  id                String    @id @default(cuid())
+  code              String    @unique
+  name              String
+  composition       String?
+  color             String?
+  costPerMeterMinor BigInt?
+  onHandMeters      Decimal?  @db.Decimal(10, 2) // physical measure, not money — Decimal OK
+  supplierNote      String?
+  deletedAt         DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  fabricOptions ProductFabricOption[]
+  orderItems    OrderItem[]
+  tailoringJobs TailoringJob[]
+
+  @@map("fabrics")
+}
+
+/// Explicit m:n — which fabrics a MADE_TO_ORDER product can be made in.
+model ProductFabricOption {
+  productId String
+  fabricId  String
+  createdAt DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id])
+  fabric  Fabric  @relation(fields: [fabricId], references: [id])
+
+  @@id([productId, fabricId])
+  @@index([fabricId])
+  @@map("product_fabric_options")
+}
+
+// ============================================================================
+// INVENTORY  (PHASE 1: accessories only; hero MTO products have NO stock)
+// ============================================================================
+
+model StockLevel {
+  id                String   @id @default(cuid())
+  variantId         String
+  branchId          String
+  onHand            Int      @default(0)
+  reserved          Int      @default(0) // PHASE 2 — keep 0 until overselling is real
+  lowStockThreshold Int      @default(2)
+  updatedAt         DateTime @updatedAt
+
+  variant ProductVariant @relation(fields: [variantId], references: [id])
+  branch  Branch         @relation(fields: [branchId], references: [id])
+
+  @@unique([variantId, branchId])
+  @@index([branchId])
+  @@map("stock_levels")
+}
+
+/// Lightweight audit of manual stock edits (PHASE 2). NOT a full ledger.
+model StockAdjustment {
+  id        String   @id @default(cuid())
+  variantId String
+  branchId  String
+  delta     Int // +/- change
+  reason    String?
+  staffId   String?
+  createdAt DateTime @default(now())
+
+  variant ProductVariant @relation(fields: [variantId], references: [id])
+  branch  Branch         @relation(fields: [branchId], references: [id])
+  staff   Staff?         @relation(fields: [staffId], references: [id])
+
+  @@index([variantId, branchId])
+  @@map("stock_adjustments")
+}
+
+// ============================================================================
+// MEASUREMENTS
+// ============================================================================
+
+/// Reusable template per customer. The OrderItem snapshot is the contract of
+/// record — editing a profile must NEVER mutate an in-production order.
+model MeasurementProfile {
+  id           String    @id @default(cuid())
+  customerId   String
+  label        String // "Groom - Ali"
+  garmentType  String? // sherwani / prince_coat / suit
+  measurements Json // { chest, waist, shoulder, sleeve, sherwani_length, ... }
+  isDefault    Boolean   @default(false)
+  version      Int       @default(1)
+  deletedAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  @@index([customerId])
+  @@map("measurement_profiles")
+}
+
+// ============================================================================
+// ORDERS & PAYMENTS  (financial records — NEVER soft-deleted)
+// ============================================================================
+
+model Order {
+  id         String     @id @default(cuid())
+  orderRef   String     @unique // human-facing, e.g. QES-2026-0412
+  customerId String
+  branchId   String
+  channel    Channel    @default(WHATSAPP)
+  source     LeadSource @default(DIRECT_WHATSAPP)
+
+  orderStatus          OrderStatus     @default(LEAD)
+  paymentStatus        PaymentStatus   @default(UNPAID) // denormalized; recompute on every Payment write
+  fulfillmentType      FulfillmentType @default(IN_STORE_COLLECTION)
+  confirmedViaWhatsapp Boolean         @default(false) // highest-ROI RTO reducer
+
+  currency              String  @default("PKR")
+  subtotalMinor         BigInt  @default(0)
+  discountMinor         BigInt  @default(0)
+  totalMinor            BigInt  @default(0)
+  depositRequiredMinor  BigInt  @default(0) // SOFT default — overridable per order
+  depositOverrideReason String?
+
+  couponId        String?
+  notes           String?
+  cancelledReason String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  customer          Customer          @relation(fields: [customerId], references: [id])
+  branch            Branch            @relation(fields: [branchId], references: [id])
+  coupon            Coupon?           @relation(fields: [couponId], references: [id])
+  items             OrderItem[]
+  payments          Payment[]
+  events            OrderEvent[]
+  shipments         Shipment[]
+  appointments      Appointment[]
+  couponRedemption  CouponRedemption?
+  convertedFromLead Lead?
+
+  @@index([customerId])
+  @@index([branchId, orderStatus, createdAt])
+  @@index([paymentStatus])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id                  String   @id @default(cuid())
+  orderId             String
+  productId           String?
+  variantId           String?
+  fabricId            String?
+  itemKind            ItemKind @default(MADE_TO_ORDER)
+  productName         String // snapshot (product may be renamed/deleted later)
+  qty                 Int      @default(1)
+  unitPriceMinor      BigInt // snapshot
+  lineTotalMinor      BigInt
+  measurementSnapshot Json? // frozen measurements for MADE_TO_ORDER
+  fabricNote          String?
+  createdAt           DateTime @default(now())
+
+  order        Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product      Product?        @relation(fields: [productId], references: [id])
+  variant      ProductVariant? @relation(fields: [variantId], references: [id])
+  fabric       Fabric?         @relation(fields: [fabricId], references: [id])
+  tailoringJob TailoringJob?
+
+  @@index([orderId])
+  @@index([productId])
+  @@map("order_items")
+}
+
+/// Multi-stage payments. gross/tax_withheld/net support FBR 2025-26 reconciliation.
+model Payment {
+  id                String              @id @default(cuid())
+  orderId           String
+  type              PaymentType
+  method            PaymentMethod
+  amountMinor       BigInt
+  grossMinor        BigInt? // for settlement reconciliation (nullable until known)
+  taxWithheldMinor  BigInt?
+  netMinor          BigInt?
+  status            PaymentRecordStatus @default(PENDING)
+  proofUrl          String? // screenshot / payment-link
+  senderName        String? // fake-screenshot fraud check
+  accountTail       String? // last digits of sender account
+  verifiedByStaffId String?
+  collectedAt       DateTime?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
+  order      Order  @relation(fields: [orderId], references: [id])
+  verifiedBy Staff? @relation("VerifiedBy", fields: [verifiedByStaffId], references: [id])
+
+  @@index([orderId])
+  @@index([status, collectedAt]) // verification queue
+  @@map("payments")
+}
+
+/// PHASE 2 — only when a courier is integrated (accessory tail).
+model Shipment {
+  id               String         @id @default(cuid())
+  orderId          String
+  branchId         String // origin
+  courier          Courier
+  trackingNo       String?
+  codAmountMinor   BigInt?
+  codReceivedMinor BigInt? // actual remittance — surfaces leakage
+  status           ShipmentStatus @default(BOOKED)
+  dispatchedAt     DateTime?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  order  Order  @relation(fields: [orderId], references: [id])
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@index([orderId])
+  @@index([status])
+  @@map("shipments")
+}
+
+/// Append-only order timeline + audit. Drives status history & WhatsApp pings.
+model OrderEvent {
+  id           String         @id @default(cuid())
+  orderId      String
+  type         OrderEventType
+  actorStaffId String?
+  payload      Json? // { fromStatus, toStatus, fromStage, toStage, amount, ... }
+  note         String?
+  createdAt    DateTime       @default(now())
+
+  order Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  actor Staff? @relation(fields: [actorStaffId], references: [id])
+
+  @@index([orderId, createdAt])
+  @@map("order_events")
+}
+
+// ============================================================================
+// TAILORING WORKFLOW  (groom-wear production)
+// ============================================================================
+
+/// 1:1 with a MADE_TO_ORDER OrderItem. Explicit state machine.
+/// PHASE 1 can collapse this to a stage column on OrderItem + OrderEvent;
+/// promote to this entity once staff are tapping stages at volume.
+model TailoringJob {
+  id                  String            @id @default(cuid())
+  orderItemId         String            @unique
+  branchId            String
+  stage               TailoringStage    @default(ENQUIRY)
+  assignedTailorId    String?
+  fabricId            String?
+  measurementSnapshot Json?
+  measurementMethod   MeasurementMethod @default(IN_STORE)
+  isRemote            Boolean           @default(false) // out-of-city → higher deposit, no COD
+  promisedReadyDate   DateTime?
+  startedAt           DateTime?
+  readyAt             DateTime?
+  reworkCount         Int               @default(0)
+  notes               String?
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  orderItem      OrderItem        @relation(fields: [orderItemId], references: [id])
+  branch         Branch           @relation(fields: [branchId], references: [id])
+  assignedTailor Staff?           @relation("AssignedTailor", fields: [assignedTailorId], references: [id])
+  fabric         Fabric?          @relation(fields: [fabricId], references: [id])
+  events         TailoringEvent[]
+  appointments   Appointment[]
+
+  @@index([branchId, stage])
+  @@index([assignedTailorId])
+  @@index([promisedReadyDate])
+  @@map("tailoring_jobs")
+}
+
+model TailoringEvent {
+  id             String          @id @default(cuid())
+  tailoringJobId String
+  fromStage      TailoringStage?
+  toStage        TailoringStage
+  staffId        String?
+  note           String?
+  photoUrl       String? // karigars snap a photo instead of typing
+  createdAt      DateTime        @default(now())
+
+  tailoringJob TailoringJob @relation(fields: [tailoringJobId], references: [id], onDelete: Cascade)
+  staff        Staff?       @relation(fields: [staffId], references: [id])
+
+  @@index([tailoringJobId, createdAt])
+  @@map("tailoring_events")
+}
+
+// ============================================================================
+// APPOINTMENTS  (fittings, consultations, collection)
+// ============================================================================
+
+model Appointment {
+  id             String            @id @default(cuid())
+  customerId     String
+  branchId       String
+  type           AppointmentType   @default(FITTING)
+  status         AppointmentStatus @default(SCHEDULED)
+  scheduledAt    DateTime
+  orderId        String?
+  tailoringJobId String?
+  staffId        String?
+  outcome        String? // PASS / NEEDS_REWORK (free text at MVP)
+  notes          String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  customer     Customer      @relation(fields: [customerId], references: [id])
+  branch       Branch        @relation(fields: [branchId], references: [id])
+  order        Order?        @relation(fields: [orderId], references: [id])
+  tailoringJob TailoringJob? @relation(fields: [tailoringJobId], references: [id])
+  staff        Staff?        @relation(fields: [staffId], references: [id])
+
+  @@index([branchId, scheduledAt])
+  @@index([status])
+  @@index([customerId])
+  @@map("appointments")
+}
+
+// ============================================================================
+// WHATSAPP LEADS / CRM-LITE
+// ============================================================================
+
+/// First-class for BOTH web-origin (sendBeacon before wa.me) AND direct
+/// inbound (staff create from a phone in 2 taps). Stage mirrors order vocab.
+model Lead {
+  id               String     @id @default(cuid())
+  ref              String     @unique // QES-2026-0412 — generated at creation moment
+  phone            String // identity even before a Customer row exists
+  customerId       String?
+  productId        String?
+  variantId        String?
+  sizeNote         String? // "custom — will share measurements"
+  city             String?
+  source           LeadSource @default(DIRECT_WHATSAPP)
+  stage            LeadStage  @default(ENQUIRY)
+  channel          Channel    @default(WHATSAPP)
+  pageUrl          String?
+  utmSource        String?
+  utmCampaign      String?
+  convertedOrderId String?    @unique
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  customer       Customer? @relation(fields: [customerId], references: [id])
+  product        Product?  @relation(fields: [productId], references: [id])
+  convertedOrder Order?    @relation(fields: [convertedOrderId], references: [id])
+
+  @@index([phone])
+  @@index([stage])
+  @@index([source])
+  @@index([createdAt])
+  @@map("leads")
+}
+
+// ============================================================================
+// DISCOUNTS / COUPONS
+// ============================================================================
+
+model Coupon {
+  id               String     @id @default(cuid())
+  code             String     @unique
+  type             CouponType
+  value            BigInt // PERCENT: basis points (e.g. 1000 = 10%); FIXED: paisa
+  minOrderMinor    BigInt     @default(0)
+  maxDiscountMinor BigInt? // cap for PERCENT
+  startsAt         DateTime?
+  endsAt           DateTime?
+  usageLimit       Int? // global
+  usedCount        Int        @default(0)
+  perCustomerLimit Int?       @default(1)
+  isActive         Boolean    @default(true)
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  orders      Order[]
+  redemptions CouponRedemption[]
+
+  @@index([isActive, endsAt])
+  @@map("coupons")
+}
+
+model CouponRedemption {
+  id          String   @id @default(cuid())
+  couponId    String
+  orderId     String   @unique
+  customerId  String
+  amountMinor BigInt
+  createdAt   DateTime @default(now())
+
+  coupon   Coupon   @relation(fields: [couponId], references: [id])
+  order    Order    @relation(fields: [orderId], references: [id])
+  customer Customer @relation(fields: [customerId], references: [id])
+
+  @@index([couponId])
+  @@index([customerId])
+  @@map("coupon_redemptions")
+}
+
+// ============================================================================
+// CMS / BLOG / SEO  (PHASE 2 — blog is MDX-in-git at launch; build these tables
+//                    only when a non-technical editor must publish without git)
+// ============================================================================
+
+model BlogPost {
+  id              String        @id @default(cuid())
+  slug            String        @unique
+  type            ContentType   @default(ARTICLE)
+  title           String
+  excerpt         String?
+  body            String? // MDX/markdown
+  status          ContentStatus @default(DRAFT)
+  publishedAt     DateTime?
+  authorStaffId   String?
+  // SEO
+  metaTitle       String?
+  metaDescription String?
+  ogImageKey      String?
+  readingTime     Int?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  author       Staff?               @relation(fields: [authorStaffId], references: [id])
+  tags         BlogTag[]            @relation("BlogPostTags")
+  productLinks ContentProductLink[]
+
+  @@index([status, publishedAt])
+  @@map("blog_posts")
+}
+
+model BlogTag {
+  id    String     @id @default(cuid())
+  slug  String     @unique
+  name  String
+  posts BlogPost[] @relation("BlogPostTags")
+
+  @@map("blog_tags")
+}
+
+/// Products featured in a post/lookbook (renders from live catalog).
+model ContentProductLink {
+  id         String @id @default(cuid())
+  blogPostId String
+  productId  String
+  sortOrder  Int    @default(0)
+
+  blogPost BlogPost @relation(fields: [blogPostId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id])
+
+  @@unique([blogPostId, productId])
+  @@index([productId])
+  @@map("content_product_links")
+}
+
+/// 301/302 redirects for slug renames — protects SEO.
+model Redirect {
+  id         String   @id @default(cuid())
+  fromPath   String   @unique
+  toPath     String
+  statusCode Int      @default(301)
+  createdAt  DateTime @default(now())
+
+  @@map("redirects")
+}
+
+/// Editable homepage / site blocks (key -> JSON), with code-defined defaults.
+model SiteBlock {
+  key       String   @id // "homepage.hero", "footer.contact"
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("site_blocks")
+}
+
+// ============================================================================
+// ANALYTICS  (high-volume, append-only — NO foreign keys, partition by month)
+// ============================================================================
+
+/// Server-side event store. The durable record behind the WhatsApp funnel
+/// (client GA4 is lossy). IDs stored as plain strings (no FK) to keep writes
+/// cheap and allow range partitioning / archival. See docs/DATABASE.md.
+model AnalyticsEvent {
+  id          String   @id @default(cuid())
+  eventType   String // whatsapp_click | view_product | phone_click | directions_click | ...
+  sessionId   String?
+  customerId  String?
+  leadId      String?
+  productId   String?
+  variantId   String?
+  referenceId String? // QES ref — bridges web session to WhatsApp close
+  source      String?
+  utmCampaign String?
+  pageUrl     String?
+  payload     Json?
+  createdAt   DateTime @default(now())
+
+  @@index([eventType, createdAt])
+  @@index([referenceId])
+  @@index([createdAt]) // candidate for BRIN + range partition (raw SQL)
+  @@map("analytics_events")
+}
+
+// ============================================================================
+// AUDIT  (admin mutations — distinct from OrderEvent domain timeline)
+// ============================================================================
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorStaffId String?
+  action       String // "payment.verify", "product.update", "order.cancel"
+  entityType   String
+  entityId     String
+  before       Json?
+  after        Json?
+  ip           String?
+  createdAt    DateTime @default(now())
+
+  actor Staff? @relation(fields: [actorStaffId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([actorStaffId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
