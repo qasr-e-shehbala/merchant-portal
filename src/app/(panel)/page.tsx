@@ -3,6 +3,7 @@ import Link from "next/link";
 import { Plus } from "lucide-react";
 import { DashboardStats } from "@/components/admin/dashboard-stats";
 import { RevenueStrip } from "@/components/admin/revenue-strip";
+import { LiveRefresh } from "@/components/admin/live-refresh";
 import { RecentOrders } from "@/components/admin/recent-orders";
 import { PendingPayments } from "@/components/admin/pending-payments";
 import { ActiveTailoringJobs } from "@/components/admin/active-tailoring-jobs";
@@ -17,7 +18,10 @@ export default function AdminDashboard() {
     <div className="space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold text-gray-900">Dashboard</h1>
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-semibold text-gray-900">Dashboard</h1>
+            <LiveRefresh />
+          </div>
           <p className="mt-1 text-sm text-gray-500">
             {new Date().toLocaleDateString("en-PK", {
               weekday: "long",

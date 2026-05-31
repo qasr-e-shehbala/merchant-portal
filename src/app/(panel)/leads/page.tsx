@@ -1,24 +1,11 @@
 import type { Metadata } from "next";
 import { DataTable, type Column } from "@/components/admin/data-table";
+import { LiveRefresh } from "@/components/admin/live-refresh";
 import { formatDate } from "@/lib/utils";
+import { getLeads, type LeadRow } from "@/server/leads/queries";
+
 export const metadata: Metadata = { title: "WhatsApp Leads" };
 export const dynamic = "force-dynamic";
-
-interface LeadRow {
-  id: string;
-  ref: string;
-  phone: string;
-  customerName?: string;
-  city?: string;
-  source: string;
-  stage: string;
-  productName?: string;
-  createdAt: string;
-}
-
-async function getLeads(): Promise<LeadRow[]> {
-  return [];
-}
 
 const COLUMNS: Column<LeadRow>[] = [
   {
@@ -90,9 +77,14 @@ export default async function LeadsPage() {
 
   return (
     <div className="space-y-5">
+      <div className="flex items-center justify-between gap-3">
+        <h1 className="text-2xl font-semibold text-gray-900">WhatsApp & Web Leads</h1>
+        <LiveRefresh />
+      </div>
+
       <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
-        <strong>Tip:</strong> Most leads arrive via WhatsApp or walk-in. Create a lead manually using the
-        &ldquo;New Lead&rdquo; button when a customer contacts you directly — so it&rsquo;s tracked even without a web session.
+        <strong>Tip:</strong> Web enquiries land here automatically the moment a customer taps WhatsApp or
+        submits a form on the website. Walk-in and direct contacts can be added as orders from the Orders page.
       </div>
 
       <DataTable
