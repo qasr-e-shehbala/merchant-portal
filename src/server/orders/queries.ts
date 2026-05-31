@@ -220,3 +220,65 @@ export async function getDashboardStats(): Promise<DashboardStats> {
     { newLeadsToday: 0, openOrders: 0, pendingVerifications: 0, activeJobs: 0 }
   );
 }
+
+export interface RevenueStats {
+  collectedTodayMinor: string;
+  collectedMonthMinor: string;
+  orderValueMonthMinor: string;
+  ordersThisMonth: number;
+  walkInsThisMonth: number;
+  onlineThisMonth: number;
+}
+
+/** Verified cash + transfers actually collected, plus order value booked this month. */
+export async function getRevenueStats(): Promise<RevenueStats> {
+  const empty: RevenueStats = {
+    collectedTodayMinor: "0",
+    collectedMonthMinor: "0",
+    orderValueMonthMinor: "0",
+    ordersThisMonth: 0,
+    walkInsThisMonth: 0,
+    onlineThisMonth: 0,
+  };
+
+  return safeQuery(async () => {
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const startOfMonth = new Date(startOfToday.getFullYear(), startOfToday.getMonth(), 1);
+
+    const [collectedToday, collectedMonth, orderValueMonth, ordersThisMonth, walkInsThisMonth] =
+      await Promise.all([
+        prisma.payment.aggregate({
+          _sum: { amountMinor: true },
+          where: { status: "VERIFIED", collectedAt: { gte: startOfToday } },
+        }),
+        prisma.payment.aggregate({
+          _sum: { amountMinor: true },
+          where: { status: "VERIFIED", collectedAt: { gte: startOfMonth } },
+        }),
+        prisma.order.aggregate({
+          _sum: { totalMinor: true },
+          where: { createdAt: { gte: startOfMonth }, orderStatus: { not: "CANCELLED" } },
+        }),
+        prisma.order.count({
+          where: { createdAt: { gte: startOfMonth }, orderStatus: { not: "CANCELLED" } },
+        }),
+        prisma.order.count({
+          where: {
+            createdAt: { gte: startOfMonth },
+            orderStatus: { not: "CANCELLED" },
+            channel: "IN_STORE",
+          },
+        }),
+      ]);
+
+    return {
+      collectedTodayMinor: (collectedToday._sum.amountMinor ?? 0n).toString(),
+      collectedMonthMinor: (collectedMonth._sum.amountMinor ?? 0n).toString(),
+      orderValueMonthMinor: (orderValueMonth._sum.totalMinor ?? 0n).toString(),
+      ordersThisMonth,
+      walkInsThisMonth,
+      onlineThisMonth: ordersThisMonth - walkInsThisMonth,
+    };
+  }, empty);
+}
